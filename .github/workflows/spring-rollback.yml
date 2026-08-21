@@ -31,7 +31,8 @@ on:
         required: false
         default: rezatron-labs/platform-gitops
         type: string
-      overlay-path:
+      overlay-dir:
+        description: "Gitops overlay directory; defaults to <service>. Nested for platform stacks."
         required: false
         default: ""
         type: string
@@ -78,6 +79,6 @@ jobs:
       image-tag: ${{ inputs.image-tag }}
       registry: ${{ inputs.registry }}
       gitops-repo: ${{ inputs.gitops-repo }}
-      overlay-path: ${{ inputs.overlay-path }}
+      overlay-dir: ${{ inputs.overlay-dir }}
       runner: ${{ inputs.runner }}
     secrets: inherit

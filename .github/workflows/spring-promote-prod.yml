@@ -28,6 +28,14 @@ on:
         required: false
         default: ""
         type: string
+      verify-args:
+        description: >
+          Extra arguments appended to `./mvnw -B verify`. A service whose integration tests
+          cannot run on the self-hosted pool passes -DskipITs here and runs them in its own
+          lane on a hosted runner.
+        required: false
+        default: ""
+        type: string
       java-version:
         required: false
         default: "21"
@@ -40,7 +48,8 @@ on:
         required: false
         default: rezatron-labs/platform-gitops
         type: string
-      overlay-path:
+      overlay-dir:
+        description: "Gitops overlay directory; defaults to <service>. Nested for platform stacks."
         required: false
         default: ""
         type: string
@@ -66,7 +75,7 @@ jobs:
       RC_IN: ${{ inputs.candidate }}
       SERVICE: ${{ inputs.service }}
       REGISTRY: ${{ inputs.registry }}
-      OVERLAY_IN: ${{ inputs.overlay-path }}
+      OVERLAY_DIR: ${{ inputs.overlay-dir }}
     steps:
       - name: Checkout main (full history for the merge)
         uses: actions/checkout@v4
@@ -100,7 +109,7 @@ jobs:
             YQ=/tmp/yq
             curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
             chmod +x "$YQ"
-            OVERLAY="gitops/${OVERLAY_IN:-${SERVICE}/stage/override.yaml}"
+            OVERLAY="gitops/${OVERLAY_DIR:-$SERVICE}/stage/override.yaml"
             test -f "$OVERLAY" || { echo "::error::no stage overlay at $OVERLAY"; exit 1; }
             STAGE_IMAGE=$("$YQ" '.services.app.image' "$OVERLAY")
             RC_TAG="${STAGE_IMAGE##*:}"
@@ -188,7 +197,7 @@ jobs:
       image-tag: ${{ needs.promote.outputs.final_tag }}
       registry: ${{ inputs.registry }}
       gitops-repo: ${{ inputs.gitops-repo }}
-      overlay-path: ${{ inputs.overlay-path }}
+      overlay-dir: ${{ inputs.overlay-dir }}
       runner: ${{ inputs.runner }}
     secrets: inherit
 
@@ -265,7 +274,7 @@ jobs:
           git add pom.xml
           # Gate the resolution: whatever the merge produced has to compile and pass tests
           # before it is allowed onto develop.
-          ./mvnw -B verify
+          ./mvnw -B verify ${{ inputs.verify-args }}
           git commit -m "chore(release): back-merge v$V into develop (keep $DEV_VERSION)"
           git push origin develop
 

@@ -39,8 +39,11 @@ on:
         required: false
         default: rezatron-labs/platform-gitops
         type: string
-      overlay-path:
-        description: "Overlay to rewrite. Defaults to <service>/<env>/override.yaml."
+      overlay-dir:
+        description: >
+          Directory in the gitops repo holding the per-env overlays; the workflow appends
+          /<env>/override.yaml. Defaults to <service>. Platform stacks nest, e.g.
+          platform/config-server.
         required: false
         default: ""
         type: string
@@ -86,7 +89,7 @@ jobs:
           TARGET_ENV: ${{ inputs.env }}
           IMAGE_TAG: ${{ inputs.image-tag }}
           REGISTRY: ${{ inputs.registry }}
-          OVERLAY_IN: ${{ inputs.overlay-path }}
+          OVERLAY_DIR: ${{ inputs.overlay-dir }}
         run: |
           set -euo pipefail
           # yq as a downloaded binary, not its container: this job's `docker` talks to the HOST
@@ -96,7 +99,7 @@ jobs:
           curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
           chmod +x "$YQ"
 
-          OVERLAY="${OVERLAY_IN:-${SERVICE}/${TARGET_ENV}/override.yaml}"
+          OVERLAY="${OVERLAY_DIR:-$SERVICE}/${TARGET_ENV}/override.yaml"
           test -f "$OVERLAY" || { echo "::error::no overlay at $OVERLAY in ${{ inputs.gitops-repo }}"; exit 1; }
 
           "$YQ" -i ".services.app.image = \"${REGISTRY}/${SERVICE}:${IMAGE_TAG}\"" "$OVERLAY"

@@ -48,11 +48,33 @@ jobs:
 
 `service` is the only required input. It names both the image
 (`nexus.home:8082/<service>:<tag>`) and the gitops overlay
-(`<service>/<env>/override.yaml`). Override `java-version`, `registry`, `gitops-repo`,
-`overlay-path` or `runner` when a service differs.
+(`<service>/<env>/override.yaml`) — which holds because the platform's naming convention
+makes the repo, the image and the overlay directory one identity.
 
-A service needing extra lanes — Testcontainers integration tests on a hosted runner, say —
-adds them as further jobs in its own caller rather than growing the shared workflow.
+| Input | Default | When to set it |
+|---|---|---|
+| `service` | — | always |
+| `java-version` | `21` | a service on a different JDK |
+| `registry` | `nexus.home:8082` | — |
+| `gitops-repo` | `rezatron-labs/platform-gitops` | — |
+| `overlay-dir` | `<service>` | platform stacks that nest, e.g. `platform/config-server` |
+| `verify-args` | *(empty)* | appended to `./mvnw -B verify` |
+| `runner` | `["self-hosted","unraid"]` | a JSON array string |
+
+`verify-args` exists because the self-hosted pool runs docker-in-docker, where Testcontainers
+cannot start. A service with such tests passes `-DskipITs` here and runs the integration lane
+as its own job on a hosted runner:
+
+```yaml
+jobs:
+  verify:
+    uses: rezatron-labs/platform-ci/.github/workflows/spring-ci.yml@v1
+    with:
+      verify-args: -DskipITs
+  integration:
+    runs-on: ubuntu-latest      # Testcontainers needs a real docker daemon
+    steps: [...]
+```
 
 ### Requirements
 

@@ -9,6 +9,14 @@ name: spring-ci
 on:
   workflow_call:
     inputs:
+      verify-args:
+        description: >
+          Extra arguments appended to `./mvnw -B verify`. A service whose integration tests
+          cannot run on the self-hosted pool passes -DskipITs here and runs them in its own
+          lane on a hosted runner.
+        required: false
+        default: ""
+        type: string
       java-version:
         required: false
         default: "21"
@@ -33,4 +41,4 @@ jobs:
           cache: maven
 
       - name: Build and test
-        run: ./mvnw -B verify
+        run: ./mvnw -B verify ${{ inputs.verify-args }}

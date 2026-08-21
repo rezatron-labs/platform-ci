@@ -27,6 +27,14 @@ on:
         description: "Hotfix version, e.g. 1.2.1 (no leading v). Must be main's patch + 1."
         required: true
         type: string
+      verify-args:
+        description: >
+          Extra arguments appended to `./mvnw -B verify`. A service whose integration tests
+          cannot run on the self-hosted pool passes -DskipITs here and runs them in its own
+          lane on a hosted runner.
+        required: false
+        default: ""
+        type: string
       java-version:
         required: false
         default: "21"
@@ -39,7 +47,8 @@ on:
         required: false
         default: rezatron-labs/platform-gitops
         type: string
-      overlay-path:
+      overlay-dir:
+        description: "Gitops overlay directory; defaults to <service>. Nested for platform stacks."
         required: false
         default: ""
         type: string
@@ -162,7 +171,7 @@ jobs:
         if: env.MODE == 'candidate'
         # Urgency is exactly when a skipped test bites. An untested hotfix is a second outage
         # waiting to happen, and it ships straight onto the incident you are already in.
-        run: ./mvnw -B verify
+        run: ./mvnw -B verify ${{ inputs.verify-args }}
 
       - name: Publish candidate tag
         if: env.MODE == 'candidate'
@@ -200,6 +209,6 @@ jobs:
       image-tag: ${{ needs.candidate.outputs.rc_tag }}
       registry: ${{ inputs.registry }}
       gitops-repo: ${{ inputs.gitops-repo }}
-      overlay-path: ${{ inputs.overlay-path }}
+      overlay-dir: ${{ inputs.overlay-dir }}
       runner: ${{ inputs.runner }}
     secrets: inherit
