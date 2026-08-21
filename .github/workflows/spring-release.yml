@@ -1,0 +1,226 @@
+name: spring-release
+
+# Cut a release candidate. GitFlow release branch, build-once/promote-many delivery.
+#
+# The FIRST dispatch for a version cuts the release:
+#   - creates release/$V from develop and sets the pom to $V
+#   - moves develop to the next -SNAPSHOT, so develop stops claiming the branched version
+#   - builds <service>:v$V-rc.1 and points STAGE at it
+#
+# Every LATER dispatch for the same version builds the next candidate (rc.2, rc.3 …) from
+# whatever stabilisation work has since landed on release/$V, and re-points stage.
+#
+# The pom on the release branch carries the FINAL version, never -RC. The candidate image
+# is the image that ships — promotion re-tags it rather than rebuilding — so the version
+# baked into the jar must already read $V. Candidate-ness lives in the git and image tags.
+#
+# Nothing here touches prod: spring-promote-prod is the only door into production.
+#
+# If a run fails after the tag is pushed, recover by deleting the candidate tag
+# (`git push origin :refs/tags/v$V-rc.N`) and re-dispatching; numbering is derived from the
+# tags that exist, so it will re-use the freed number.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name, e.g. orders"
+        required: true
+        type: string
+      version:
+        description: "Release version, e.g. 1.2.0 (no leading v). Must match develop's -SNAPSHOT."
+        required: true
+        type: string
+      next-version:
+        description: "Version develop moves to after the cut. Empty means next minor."
+        required: false
+        default: ""
+        type: string
+      java-version:
+        required: false
+        default: "21"
+        type: string
+      registry:
+        required: false
+        default: nexus.home:8082
+        type: string
+      gitops-repo:
+        required: false
+        default: rezatron-labs/rezatron-gitops
+        type: string
+      overlay-path:
+        required: false
+        default: ""
+        type: string
+      runner:
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+jobs:
+  candidate:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    outputs:
+      rc_tag: ${{ steps.plan.outputs.rc_tag }}
+    env:
+      V: ${{ inputs.version }}
+      NEXT_IN: ${{ inputs.next-version }}
+      SERVICE: ${{ inputs.service }}
+      REGISTRY: ${{ inputs.registry }}
+    steps:
+      - name: Checkout develop (full history for branches + tags)
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Plan the candidate
+        id: plan
+        run: |
+          set -euo pipefail
+          git fetch --prune --tags origin "+refs/heads/*:refs/remotes/origin/*"
+          # Re-point at the freshly fetched develop so the pom that gets validated is the pom
+          # on the commit we are about to branch from, not the one checkout happened to land
+          # on before the fetch.
+          git switch -q -C develop origin/develop
+
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be MAJOR.MINOR.PATCH with no leading v (got '$V')"; exit 1; }
+
+          if git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+            echo "::error::v$V is already tagged — that version has shipped. Cut the next one."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/remotes/origin/release/$V" >/dev/null; then
+            MODE=candidate
+          else
+            MODE=cut
+          fi
+
+          # Candidate numbering is derived from the tags that exist rather than taken as an
+          # input, so a re-dispatch can never silently overwrite a published candidate.
+          LAST=$(git tag -l "v$V-rc.*" | sed "s|^v$V-rc\.||" | grep -Ex '[0-9]+' | sort -n | tail -n1 || true)
+          RC=$(( ${LAST:-0} + 1 ))
+
+          MAJOR=${V%%.*}; TAIL=${V#*.}; MINOR=${TAIL%%.*}
+          NEXT="${NEXT_IN:-$MAJOR.$((MINOR + 1)).0}"
+          echo "$NEXT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::next-version must be MAJOR.MINOR.PATCH (got '$NEXT')"; exit 1; }
+          if [ "$NEXT" = "$V" ] || [ "$(printf '%s\n%s\n' "$V" "$NEXT" | sort -V | tail -n1)" != "$NEXT" ]; then
+            echo "::error::next-version ($NEXT) must be greater than the release version ($V)"
+            exit 1
+          fi
+
+          {
+            echo "MODE=$MODE"
+            echo "NEXT=$NEXT"
+            echo "RC_TAG=v$V-rc.$RC"
+          } >> "$GITHUB_ENV"
+          echo "rc_tag=v$V-rc.$RC" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE  candidate=v$V-rc.$RC  develop-moves-to=$NEXT-SNAPSHOT (on a cut)"
+
+      - name: Check out the release branch
+        run: |
+          set -euo pipefail
+          git config user.name ci-bot
+          git config user.email ci@rezatron
+
+          if [ "$MODE" = cut ]; then
+            # develop's pom is the source of truth for what develop is becoming. When it
+            # disagrees with the requested version, the disagreement IS the bug — refuse
+            # rather than mint a tag the history never claimed.
+            POM=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+            if [ "$POM" != "$V-SNAPSHOT" ]; then
+              echo "::error::develop's pom is $POM but you asked to release $V."
+              echo "::error::Land a 'chore: bump develop to $V-SNAPSHOT' commit on develop first, then re-dispatch."
+              exit 1
+            fi
+            git switch -c "release/$V" origin/develop
+            ./mvnw -B -q versions:set -DnewVersion="$V" -DgenerateBackupPoms=false
+            git add pom.xml
+            git commit -m "chore(release): set version $V"
+          else
+            git switch -C "release/$V" "origin/release/$V"
+            POM=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+            if [ "$POM" != "$V" ]; then
+              echo "::error::release/$V has pom version $POM, expected $V — the release pom is not hand-edited."
+              exit 1
+            fi
+          fi
+
+      - name: Build and test the candidate
+        # Without this the release path executes no tests at all: spring-ci runs only on
+        # pull_request, and the Dockerfile packages with -DskipTests. It runs before anything
+        # is pushed, so a red build leaves no branch, tag or image behind.
+        run: ./mvnw -B verify
+
+      - name: Publish the release branch and candidate tag
+        run: |
+          set -euo pipefail
+          git tag -a "$RC_TAG" -m "$SERVICE $RC_TAG"
+          git push origin "release/$V"
+          git push origin "refs/tags/$RC_TAG"
+
+      - name: Move develop to the next -SNAPSHOT
+        if: env.MODE == 'cut'
+        # GitFlow bumps develop when the release is CUT, not when it reaches prod. Deferring it
+        # leaves develop — and so every int build's /actuator/info — claiming the version that
+        # just branched away, for the entire length of the stage soak.
+        #
+        # This push wakes the service's publish workflow, which is intended: int should track
+        # develop, and that build is what makes int start reporting the new -SNAPSHOT.
+        run: |
+          set -euo pipefail
+          git switch -C develop origin/develop
+          ./mvnw -B -q versions:set -DnewVersion="$NEXT-SNAPSHOT" -DgenerateBackupPoms=false
+          git add pom.xml
+          git commit -m "chore(release): begin $NEXT-SNAPSHOT"
+          git push origin develop
+          git switch "release/$V"
+
+      - name: Build and push the candidate image
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
+          docker push "$REGISTRY/$SERVICE:$RC_TAG"
+
+      - name: Create GitHub pre-release
+        # curl rather than `gh`: never assume tooling on a self-hosted runner. Marked
+        # prerelease so "latest release" keeps pointing at the last thing that reached prod.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"$RC_TAG\",\"name\":\"$RC_TAG\",\"prerelease\":true,\"generate_release_notes\":true}"
+
+  deploy-stage:
+    needs: candidate
+    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    with:
+      service: ${{ inputs.service }}
+      env: stage
+      image-tag: ${{ needs.candidate.outputs.rc_tag }}
+      registry: ${{ inputs.registry }}
+      gitops-repo: ${{ inputs.gitops-repo }}
+      overlay-path: ${{ inputs.overlay-path }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit

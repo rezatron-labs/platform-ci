@@ -1,0 +1,281 @@
+name: spring-promote-prod
+
+# The PROD gate. Native required-reviewer Environment protection is unavailable on this plan,
+# so THE GATE IS THIS DELIBERATE MANUAL DISPATCH: a human promotes a candidate stage has
+# already validated. The dispatching actor is recorded on the run, and the ci-bot commit pins
+# the version in gitops.
+#
+# Promotion is a registry RE-TAG, never a rebuild: prod runs the exact bytes stage soaked, and
+# the digest assertion below turns that from an intention into a checked guarantee.
+#
+# It promotes a release/$V or a hotfix/$V identically.
+#
+# Job order is deliberate: prod is deployed BEFORE the develop back-merge, so a merge conflict
+# in housekeeping can never stand between a validated build and production.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      version:
+        description: "Version to promote, e.g. 1.2.0 (must have a candidate on stage)"
+        required: true
+        type: string
+      candidate:
+        description: "Candidate number to promote. Empty means whatever stage is running."
+        required: false
+        default: ""
+        type: string
+      java-version:
+        required: false
+        default: "21"
+        type: string
+      registry:
+        required: false
+        default: nexus.home:8082
+        type: string
+      gitops-repo:
+        required: false
+        default: rezatron-labs/rezatron-gitops
+        type: string
+      overlay-path:
+        required: false
+        default: ""
+        type: string
+      runner:
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+jobs:
+  promote:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    outputs:
+      final_tag: ${{ steps.resolve.outputs.final_tag }}
+    env:
+      V: ${{ inputs.version }}
+      RC_IN: ${{ inputs.candidate }}
+      SERVICE: ${{ inputs.service }}
+      REGISTRY: ${{ inputs.registry }}
+      OVERLAY_IN: ${{ inputs.overlay-path }}
+    steps:
+      - name: Checkout main (full history for the merge)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Checkout gitops (to read what stage is running)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          ref: main
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+
+      - name: Resolve the candidate to promote
+        id: resolve
+        run: |
+          set -euo pipefail
+          git fetch --prune --tags origin "+refs/heads/*:refs/remotes/origin/*"
+
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be MAJOR.MINOR.PATCH with no leading v (got '$V')"; exit 1; }
+
+          if [ -n "$RC_IN" ]; then
+            RC_TAG="v$V-rc.$RC_IN"
+          else
+            # Default to exactly what stage is running. Promoting "the newest candidate" would
+            # let a build nobody soaked reach prod; promoting what the stage overlay points at
+            # means prod gets the bytes that were actually validated.
+            YQ=/tmp/yq
+            curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
+            chmod +x "$YQ"
+            OVERLAY="gitops/${OVERLAY_IN:-${SERVICE}/stage/override.yaml}"
+            test -f "$OVERLAY" || { echo "::error::no stage overlay at $OVERLAY"; exit 1; }
+            STAGE_IMAGE=$("$YQ" '.services.app.image' "$OVERLAY")
+            RC_TAG="${STAGE_IMAGE##*:}"
+          fi
+
+          case "$RC_TAG" in
+            "v$V-rc."*) ;;
+            *) echo "::error::stage is running '$RC_TAG', which is not a candidate of $V."
+               echo "::error::Release $V to stage first, or pass an explicit candidate number."
+               exit 1 ;;
+          esac
+
+          git rev-parse -q --verify "refs/tags/$RC_TAG" >/dev/null \
+            || { echo "::error::no git tag $RC_TAG — that candidate was never published"; exit 1; }
+
+          # Which branch holds the stabilised work: a normal release, or a hotfix cut off main.
+          if git rev-parse -q --verify "refs/remotes/origin/release/$V" >/dev/null; then
+            SRC_BRANCH="release/$V"
+          elif git rev-parse -q --verify "refs/remotes/origin/hotfix/$V" >/dev/null; then
+            SRC_BRANCH="hotfix/$V"
+          else
+            echo "::error::neither release/$V nor hotfix/$V exists on origin — nothing to promote"
+            exit 1
+          fi
+
+          {
+            echo "RC_TAG=$RC_TAG"
+            echo "SRC_BRANCH=$SRC_BRANCH"
+          } >> "$GITHUB_ENV"
+          echo "final_tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "promoting $RC_TAG from $SRC_BRANCH to prod as v$V"
+
+      - name: Merge into main and tag the release
+        run: |
+          set -euo pipefail
+          git config user.name ci-bot
+          git config user.email ci@rezatron
+          git switch -C main origin/main
+
+          # Both guards make a re-run after a partial failure a no-op rather than an error.
+          if git merge-base --is-ancestor "refs/tags/$RC_TAG" HEAD; then
+            echo "main already contains $RC_TAG; skipping merge"
+          else
+            git merge --no-ff "origin/$SRC_BRANCH" -m "release: promote v$V to prod"
+          fi
+
+          # The final tag lands on main, where GitFlow says a release is born. The rc tags
+          # record what was BUILT; this one records what SHIPPED.
+          if git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+            echo "tag v$V already exists; leaving it alone (immutable)"
+          else
+            git tag -a "v$V" -m "$SERVICE v$V"
+          fi
+
+          git push origin main
+          git push origin "refs/tags/v$V"
+
+      - name: Re-tag the validated candidate as the final version
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          SRC="$REGISTRY/$SERVICE:$RC_TAG"
+          DST="$REGISTRY/$SERVICE:v$V"
+
+          docker pull "$SRC"
+          SRC_DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$SRC" \
+            | grep "^$REGISTRY/$SERVICE@" | head -n1 | cut -d@ -f2)
+          docker tag "$SRC" "$DST"
+          DST_DIGEST=$(docker push "$DST" | grep -oE 'sha256:[0-9a-f]{64}' | tail -n1)
+
+          # If these ever differ, something rebuilt instead of re-tagging and prod would be
+          # running code stage never saw. That is the one thing this pipeline must not do.
+          if [ -z "$SRC_DIGEST" ] || [ "$SRC_DIGEST" != "$DST_DIGEST" ]; then
+            echo "::error::promoted digest ($DST_DIGEST) does not match the validated candidate ($SRC_DIGEST)"
+            exit 1
+          fi
+          echo "prod will run $DST @ $DST_DIGEST — byte-identical to $SRC"
+
+  deploy-prod:
+    needs: promote
+    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    with:
+      service: ${{ inputs.service }}
+      env: prod
+      image-tag: ${{ needs.promote.outputs.final_tag }}
+      registry: ${{ inputs.registry }}
+      gitops-repo: ${{ inputs.gitops-repo }}
+      overlay-path: ${{ inputs.overlay-path }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit
+
+  close-out:
+    # Housekeeping, deliberately after the deploy. Closing GitFlow's loop: develop picks up
+    # anything stabilised on the release branch, and the branch itself is retired.
+    needs: [promote, deploy-prod]
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    env:
+      V: ${{ inputs.version }}
+    steps:
+      - name: Checkout develop (full history for the merge)
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Start the back-merge of main into develop
+        run: |
+          set -euo pipefail
+          git config user.name ci-bot
+          git config user.email ci@rezatron
+          git fetch --prune --tags origin "+refs/heads/*:refs/remotes/origin/*"
+          git switch -C develop origin/develop
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "develop already contains main; nothing to back-merge"
+            echo "BACKMERGE=skip" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Read develop's own version BEFORE the merge — it is the one thing that must
+          # survive it.
+          DEV_VERSION=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+
+          if git merge --no-ff --no-commit origin/main; then
+            echo "BACKMERGE=clean" >> "$GITHUB_ENV"
+          else
+            # pom.xml conflicts on EVERY release: main says $V, develop says the next
+            # -SNAPSHOT, and the merge base says neither. That one is expected. A conflict in
+            # any OTHER file is real work, and stops the run.
+            UNMERGED=$(git diff --name-only --diff-filter=U)
+            if [ "$UNMERGED" != "pom.xml" ]; then
+              echo "::error::back-merge conflicts outside pom.xml, resolve by hand:"
+              echo "$UNMERGED"
+              git merge --abort
+              exit 1
+            fi
+            echo "BACKMERGE=pom-conflict" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve the pom version conflict
+        if: env.BACKMERGE == 'pom-conflict'
+        uses: rezatron-labs/rezatron-ci/actions/resolve-pom-merge@v1
+        with:
+          version: ${{ env.DEV_VERSION }}
+
+      - name: Restore develop's version after a clean merge
+        if: env.BACKMERGE == 'clean'
+        run: ./mvnw -B -q versions:set -DnewVersion="$DEV_VERSION" -DgenerateBackupPoms=false
+
+      - name: Verify and push the back-merge
+        if: env.BACKMERGE != 'skip'
+        run: |
+          set -euo pipefail
+          git add pom.xml
+          # Gate the resolution: whatever the merge produced has to compile and pass tests
+          # before it is allowed onto develop.
+          ./mvnw -B verify
+          git commit -m "chore(release): back-merge v$V into develop (keep $DEV_VERSION)"
+          git push origin develop
+
+      - name: Retire the stabilisation branch
+        run: |
+          set -euo pipefail
+          git fetch --prune origin
+          for B in "release/$V" "hotfix/$V"; do
+            if git rev-parse -q --verify "refs/remotes/origin/$B" >/dev/null; then
+              git push origin --delete "$B"
+              echo "deleted $B — main and the v$V tag are the durable record"
+            fi
+          done

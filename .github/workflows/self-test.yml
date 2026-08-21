@@ -1,0 +1,53 @@
+name: self-test
+
+# This repo is the pipeline for every service on the platform, so a bad merge here breaks
+# all of them at once. It gets its own gate.
+#
+# Runs on GitHub-hosted runners, deliberately: if the self-hosted pool is what's broken, the
+# workflow that fixes the pipeline must not depend on it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test the pom merge resolver
+        run: sh actions/resolve-pom-merge/test-resolve-pom-merge.sh
+
+      - name: Lint shell
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -s sh actions/resolve-pom-merge/*.sh
+
+      - name: Parse every workflow and action
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob('.github/workflows/*.yml') + glob.glob('actions/*/action.yml')):
+              try:
+                  yaml.safe_load(open(f))
+                  print('ok  ', f)
+              except Exception as e:
+                  print('FAIL', f, e); bad = 1
+          sys.exit(bad)
+          PY
+
+      - name: Every internal reference is pinned to a released tag
+        # A reusable workflow calling a sibling by @main would make every service track this
+        # repo's unreviewed tip. GitHub allows no variable in `uses:`, so the refs are literal
+        # and this check is what keeps them honest when a new major is cut.
+        run: |
+          set -euo pipefail
+          if grep -rn 'rezatron-labs/rezatron-ci/.*@\(main\|master\)' .github/workflows/ actions/; then
+            echo "::error::internal references must pin a release tag, not a branch"
+            exit 1
+          fi
+          echo "internal refs:"
+          grep -rho 'rezatron-labs/rezatron-ci/[^ ]*@[^ ]*' .github/workflows/ actions/ | sort -u

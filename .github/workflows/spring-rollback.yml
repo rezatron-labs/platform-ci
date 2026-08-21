@@ -1,0 +1,83 @@
+name: spring-rollback
+
+# Recovery should be the best-rehearsed path in the pipeline, not the one improvised under
+# pressure. Because every tag the platform publishes is immutable, rolling back is just
+# deploying an older one: no build, no git surgery, no version arithmetic.
+#
+# It deliberately does NOT touch main or the pom. main records what was RELEASED; the gitops
+# overlay records what is RUNNING; after a rollback those legitimately disagree, and the
+# gitops commit is the audit trail of why. Roll forward with a hotfix to make them agree
+# again — a rollback buys time, it does not close the incident.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      env:
+        description: "Environment to roll back: int, stage or prod"
+        required: true
+        type: string
+      image-tag:
+        description: "Tag to roll back to, e.g. v1.1.0 (must already exist in the registry)"
+        required: true
+        type: string
+      registry:
+        required: false
+        default: nexus.home:8082
+        type: string
+      gitops-repo:
+        required: false
+        default: rezatron-labs/rezatron-gitops
+        type: string
+      overlay-path:
+        required: false
+        default: ""
+        type: string
+      runner:
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+jobs:
+  verify-image:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - name: Confirm the image exists before rewriting desired state
+        env:
+          IMAGE: ${{ inputs.registry }}/${{ inputs.service }}:${{ inputs.image-tag }}
+          REGISTRY: ${{ inputs.registry }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          # A typo here would point an environment at a tag that does not exist, and the failure
+          # would surface as a stuck deploy rather than a failed workflow.
+          # --insecure fallback: the registry is plain HTTP on the LAN, which the daemon is
+          # configured for but `docker manifest` is not.
+          if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1 \
+            && ! docker manifest inspect --insecure "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::no image $IMAGE in the registry — check the tag"
+            exit 1
+          fi
+          echo "$IMAGE exists; rolling ${{ inputs.env }} back to it"
+
+  deploy:
+    needs: verify-image
+    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    with:
+      service: ${{ inputs.service }}
+      env: ${{ inputs.env }}
+      image-tag: ${{ inputs.image-tag }}
+      registry: ${{ inputs.registry }}
+      gitops-repo: ${{ inputs.gitops-repo }}
+      overlay-path: ${{ inputs.overlay-path }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit

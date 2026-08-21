@@ -1,0 +1,36 @@
+name: spring-ci
+
+# The PR gate: build and test, nothing else. Deliberately does not deploy or tag, so it is
+# safe to run on untrusted branches.
+#
+# A service needing extra lanes (Testcontainers integration tests on a hosted runner, for
+# instance) adds them as further jobs in its own caller workflow rather than growing this one.
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        required: false
+        default: "21"
+        type: string
+      runner:
+        description: "runs-on labels, as a JSON array string"
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+
+jobs:
+  verify:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Build and test
+        run: ./mvnw -B verify

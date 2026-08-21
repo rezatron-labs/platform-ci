@@ -1,0 +1,19 @@
+name: Resolve pom merge
+description: >
+  Resolve a pom.xml merge conflict whose only real difference is the project version, as a
+  GitFlow back-merge produces on every release. Runs against the conflicted merge already
+  in progress in the caller's workspace.
+
+inputs:
+  version:
+    description: "Project version the merged pom should end up carrying, e.g. 1.3.0-SNAPSHOT"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # $GITHUB_ACTION_PATH resolves inside THIS repository's checkout, while the working
+    # directory stays the caller's workspace — which is exactly the split needed here: the
+    # script ships with the pipeline, the conflicted pom belongs to the service.
+    - shell: bash
+      run: sh "$GITHUB_ACTION_PATH/resolve-pom-merge.sh" "${{ inputs.version }}"

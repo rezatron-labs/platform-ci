@@ -1,0 +1,205 @@
+name: spring-hotfix
+
+# The prod repair path — GitFlow's fourth branch type, and the platform's MTTR story.
+#
+# A hotfix branches from MAIN, which is what prod is actually running, never from develop:
+# develop may be many features ahead and none of them are in scope for a fix shipping now.
+#
+# It runs in two phases, because a hotfix cut from main contains no fix yet:
+#   1. dispatch once  -> cuts hotfix/$V from main, sets the pom to $V, and stops.
+#                        Push your fix to that branch.
+#   2. dispatch again -> builds <service>:v$V-rc.N from the fixed branch, points STAGE at it.
+#      (repeat 2 as needed; each dispatch is the next candidate)
+#
+# spring-promote-prod is still the only door into prod, and promotes a hotfix exactly as it
+# promotes a release. A hotfix is faster because its diff is small, not because it skips the gate.
+#
+# develop is NOT bumped here: a patch off main does not change what develop is becoming.
+# The promotion back-merges the fix into develop when the hotfix ships.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      version:
+        description: "Hotfix version, e.g. 1.2.1 (no leading v). Must be main's patch + 1."
+        required: true
+        type: string
+      java-version:
+        required: false
+        default: "21"
+        type: string
+      registry:
+        required: false
+        default: nexus.home:8082
+        type: string
+      gitops-repo:
+        required: false
+        default: rezatron-labs/rezatron-gitops
+        type: string
+      overlay-path:
+        required: false
+        default: ""
+        type: string
+      runner:
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+jobs:
+  candidate:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      rc_tag: ${{ steps.plan.outputs.rc_tag }}
+    env:
+      V: ${{ inputs.version }}
+      SERVICE: ${{ inputs.service }}
+      REGISTRY: ${{ inputs.registry }}
+    steps:
+      - name: Checkout main (full history for branches + tags)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Plan the hotfix
+        id: plan
+        run: |
+          set -euo pipefail
+          git fetch --prune --tags origin "+refs/heads/*:refs/remotes/origin/*"
+          # Re-point at the freshly fetched main so the pom deciding the next patch number is
+          # the one prod is actually running.
+          git switch -q -C main origin/main
+
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be MAJOR.MINOR.PATCH with no leading v (got '$V')"; exit 1; }
+
+          if git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+            echo "::error::v$V is already tagged — that version has shipped."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/remotes/origin/hotfix/$V" >/dev/null; then
+            MODE=candidate
+          else
+            MODE=cut
+          fi
+
+          if [ "$MODE" = cut ]; then
+            # main's pom is what prod is running, so a hotfix is by definition its next patch.
+            # Anything larger is a release and belongs in spring-release, cut from develop.
+            MAIN_POM=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+            MAJOR=${MAIN_POM%%.*}; TAIL=${MAIN_POM#*.}; MINOR=${TAIL%%.*}; PATCH=${TAIL#*.}
+            EXPECTED="$MAJOR.$MINOR.$(( PATCH + 1 ))"
+            if [ "$V" != "$EXPECTED" ]; then
+              echo "::error::main is at $MAIN_POM, so the next hotfix is $EXPECTED, not $V."
+              echo "::error::To ship something larger, cut a release from develop instead."
+              exit 1
+            fi
+          fi
+
+          LAST=$(git tag -l "v$V-rc.*" | sed "s|^v$V-rc\.||" | grep -Ex '[0-9]+' | sort -n | tail -n1 || true)
+          RC=$(( ${LAST:-0} + 1 ))
+
+          {
+            echo "MODE=$MODE"
+            echo "RC_TAG=v$V-rc.$RC"
+          } >> "$GITHUB_ENV"
+          {
+            echo "mode=$MODE"
+            echo "rc_tag=v$V-rc.$RC"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE  next-candidate=v$V-rc.$RC"
+
+      # --- phase 1: cut the branch and stop ---
+
+      - name: Cut the hotfix branch from main
+        if: env.MODE == 'cut'
+        run: |
+          set -euo pipefail
+          git config user.name ci-bot
+          git config user.email ci@rezatron
+          git switch -c "hotfix/$V" origin/main
+          ./mvnw -B -q versions:set -DnewVersion="$V" -DgenerateBackupPoms=false
+          git add pom.xml
+          git commit -m "chore(hotfix): set version $V"
+          git push origin "hotfix/$V"
+          echo "::notice::hotfix/$V is cut from main. Push your fix to it, then re-dispatch to build v$V-rc.1 onto stage."
+
+      # --- phase 2: build a candidate from the fixed branch ---
+
+      - name: Check out the hotfix branch
+        if: env.MODE == 'candidate'
+        run: |
+          set -euo pipefail
+          git config user.name ci-bot
+          git config user.email ci@rezatron
+          git switch -C "hotfix/$V" "origin/hotfix/$V"
+          POM=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+          if [ "$POM" != "$V" ]; then
+            echo "::error::hotfix/$V has pom version $POM, expected $V — the hotfix pom is not hand-edited."
+            exit 1
+          fi
+
+      - name: Build and test the candidate
+        if: env.MODE == 'candidate'
+        # Urgency is exactly when a skipped test bites. An untested hotfix is a second outage
+        # waiting to happen, and it ships straight onto the incident you are already in.
+        run: ./mvnw -B verify
+
+      - name: Publish candidate tag
+        if: env.MODE == 'candidate'
+        run: |
+          set -euo pipefail
+          git tag -a "$RC_TAG" -m "$SERVICE $RC_TAG"
+          git push origin "refs/tags/$RC_TAG"
+
+      - name: Build and push the candidate image
+        if: env.MODE == 'candidate'
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
+          docker push "$REGISTRY/$SERVICE:$RC_TAG"
+
+      - name: Create GitHub pre-release
+        if: env.MODE == 'candidate'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"$RC_TAG\",\"name\":\"$RC_TAG\",\"prerelease\":true,\"generate_release_notes\":true}"
+
+  deploy-stage:
+    needs: candidate
+    if: needs.candidate.outputs.mode == 'candidate'
+    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    with:
+      service: ${{ inputs.service }}
+      env: stage
+      image-tag: ${{ needs.candidate.outputs.rc_tag }}
+      registry: ${{ inputs.registry }}
+      gitops-repo: ${{ inputs.gitops-repo }}
+      overlay-path: ${{ inputs.overlay-path }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit

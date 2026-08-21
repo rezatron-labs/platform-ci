@@ -1,0 +1,88 @@
+name: spring-publish
+
+# develop -> int, continuously. The only automatic deploy on the platform; every other
+# environment change is a deliberate dispatch.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name, e.g. orders"
+        required: true
+        type: string
+      java-version:
+        required: false
+        default: "21"
+        type: string
+      registry:
+        required: false
+        default: nexus.home:8082
+        type: string
+      gitops-repo:
+        required: false
+        default: rezatron-labs/rezatron-gitops
+        type: string
+      overlay-path:
+        required: false
+        default: ""
+        type: string
+      runner:
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+    secrets:
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Build and test
+        # spring-ci only covers pull_request, so anything reaching develop by a direct push —
+        # including the version bumps spring-release makes — would otherwise deploy untested.
+        run: ./mvnw -B verify
+
+      - name: Compute immutable tag
+        id: tag
+        # Integration builds are tagged sha-<short commit>. Immutable: never overwritten.
+        run: echo "tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        # No host Maven step here: the Dockerfile builds the jar inside a maven image, so the
+        # image build is the single source of truth for what ships.
+        env:
+          IMAGE: ${{ inputs.registry }}/${{ inputs.service }}:${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.NEXUS_PASS }}" | docker login "${{ inputs.registry }}" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+  deploy-int:
+    needs: build
+    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    with:
+      service: ${{ inputs.service }}
+      env: int
+      image-tag: ${{ needs.build.outputs.image_tag }}
+      registry: ${{ inputs.registry }}
+      gitops-repo: ${{ inputs.gitops-repo }}
+      overlay-path: ${{ inputs.overlay-path }}
+      runner: ${{ inputs.runner }}
+    secrets: inherit

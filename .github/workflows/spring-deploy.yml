@@ -1,0 +1,124 @@
+name: spring-deploy
+
+# The ONE way desired state is written, for every service on the platform. Int on merge,
+# stage on a release candidate, prod on promotion, and any rollback all come through here,
+# so exactly one place knows how to talk to the gitops repo.
+#
+# It only ever writes a tag that already exists in the registry: this workflow never
+# builds. Build-once/promote-many means prod runs the bytes stage validated, and that
+# property only holds if deploying is a pointer change and nothing else.
+#
+# Callers own the concurrency group so a rollback queues behind an in-flight release for
+# the same environment. Note that concurrency groups are scoped per repository, so two
+# different services deploying at once do not serialise against each other — they write
+# different overlay files, and the push below retries on rebase, which is what makes that
+# safe rather than lucky.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name, e.g. orders. Names the image and the overlay directory."
+        required: true
+        type: string
+      env:
+        description: "Target environment: int, stage or prod"
+        required: true
+        type: string
+      image-tag:
+        description: "Existing image tag, e.g. sha-8b9aea4, v1.2.0-rc.1, v1.2.0"
+        required: true
+        type: string
+      registry:
+        description: "Container registry host"
+        required: false
+        default: nexus.home:8082
+        type: string
+      gitops-repo:
+        description: "Repository holding desired state"
+        required: false
+        default: rezatron-labs/rezatron-gitops
+        type: string
+      overlay-path:
+        description: "Overlay to rewrite. Defaults to <service>/<env>/override.yaml."
+        required: false
+        default: ""
+        type: string
+      runner:
+        description: "runs-on labels, as a JSON array string"
+        required: false
+        default: '["self-hosted","unraid"]'
+        type: string
+    secrets:
+      GITOPS_DEPLOY_KEY:
+        required: true
+
+jobs:
+  write-desired-state:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - name: Validate target environment
+        shell: bash
+        env:
+          TARGET_ENV: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_ENV" in
+            int|stage|prod) ;;
+            *) echo "::error::unknown environment '$TARGET_ENV' (expected int, stage or prod)"; exit 1 ;;
+          esac
+
+      - name: Checkout gitops (write deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          # Pin the ref so checkout skips its default-branch REST lookup — that call uses the
+          # default GITHUB_TOKEN, which is scoped to the CALLING repo only and 404s here.
+          ref: main
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+
+      - name: Point ${{ inputs.env }} at ${{ inputs.service }}:${{ inputs.image-tag }}
+        working-directory: gitops
+        shell: bash
+        env:
+          SERVICE: ${{ inputs.service }}
+          TARGET_ENV: ${{ inputs.env }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REGISTRY: ${{ inputs.registry }}
+          OVERLAY_IN: ${{ inputs.overlay-path }}
+        run: |
+          set -euo pipefail
+          # yq as a downloaded binary, not its container: this job's `docker` talks to the HOST
+          # daemon over a mounted socket, so `docker run -v "$PWD:…"` would mount a host path
+          # that does not hold the runner container's checkout. A binary sees the files directly.
+          YQ=/tmp/yq
+          curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
+          chmod +x "$YQ"
+
+          OVERLAY="${OVERLAY_IN:-${SERVICE}/${TARGET_ENV}/override.yaml}"
+          test -f "$OVERLAY" || { echo "::error::no overlay at $OVERLAY in ${{ inputs.gitops-repo }}"; exit 1; }
+
+          "$YQ" -i ".services.app.image = \"${REGISTRY}/${SERVICE}:${IMAGE_TAG}\"" "$OVERLAY"
+
+          git config user.name ci-bot
+          git config user.email ci@rezatron
+          if git diff --quiet -- "$OVERLAY"; then
+            echo "${SERVICE} ${TARGET_ENV} already at ${IMAGE_TAG}; nothing to push"
+            exit 0
+          fi
+          git add "$OVERLAY"
+          git commit -m "chore(${TARGET_ENV}): ${SERVICE} -> ${IMAGE_TAG}"
+
+          # Retry: a concurrent job may push between our pull and our push. The explicit
+          # success flag matters — a bare `|| sleep` loop falls out with status 0 when every
+          # attempt failed, reporting a deploy that never landed.
+          pushed=0
+          for _ in 1 2 3 4 5; do
+            if git pull --rebase && git push; then pushed=1; break; fi
+            sleep 3
+          done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::error::could not push desired state for ${SERVICE} ${TARGET_ENV} after 5 attempts"
+            exit 1
+          fi
