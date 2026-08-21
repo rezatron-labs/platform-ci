@@ -66,6 +66,10 @@ adds them as further jobs in its own caller rather than growing the shared workf
   separately, on the same commit, before any image is built.
 - `main` and `develop` branches, and a single-module `pom.xml` whose project `<version>`
   follows `</parent>`.
+- `versions-maven-plugin` and `maven-help-plugin` pinned in the service's own
+  `<pluginManagement>`. These workflows drive both by short prefix against the service's
+  pom; unpinned, Maven resolves whatever is newest in Central at run time and how a release
+  rewrites its version can change with no commit anywhere to explain it.
 - This repository's Actions **Access** set to *"Accessible from repositories in the
   organization"*, or nothing can call it.
 
