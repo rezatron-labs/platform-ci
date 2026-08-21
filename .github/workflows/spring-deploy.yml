@@ -37,7 +37,7 @@ on:
       gitops-repo:
         description: "Repository holding desired state"
         required: false
-        default: rezatron-labs/rezatron-gitops
+        default: rezatron-labs/platform-gitops
         type: string
       overlay-path:
         description: "Overlay to rewrite. Defaults to <service>/<env>/override.yaml."

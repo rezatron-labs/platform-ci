@@ -45,9 +45,9 @@ jobs:
         # and this check is what keeps them honest when a new major is cut.
         run: |
           set -euo pipefail
-          if grep -rn 'rezatron-labs/rezatron-ci/.*@\(main\|master\)' .github/workflows/ actions/; then
+          if grep -rn 'rezatron-labs/platform-ci/.*@\(main\|master\)' .github/workflows/ actions/; then
             echo "::error::internal references must pin a release tag, not a branch"
             exit 1
           fi
           echo "internal refs:"
-          grep -rho 'rezatron-labs/rezatron-ci/[^ ]*@[^ ]*' .github/workflows/ actions/ | sort -u
+          grep -rho 'rezatron-labs/platform-ci/[^ ]*@[^ ]*' .github/workflows/ actions/ | sort -u

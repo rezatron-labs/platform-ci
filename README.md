@@ -1,4 +1,4 @@
-# rezatron-ci
+# platform-ci
 
 Shared GitHub Actions pipeline for every Spring Boot service on the Rezatron platform.
 One implementation of the release lifecycle, called by each service repo, so a fix lands
@@ -40,7 +40,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   publish:
-    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-publish.yml@v1
+    uses: rezatron-labs/platform-ci/.github/workflows/spring-publish.yml@v1
     with:
       service: myservice
     secrets: inherit
@@ -70,8 +70,9 @@ adds them as further jobs in its own caller rather than growing the shared workf
   `<pluginManagement>`. These workflows drive both by short prefix against the service's
   pom; unpinned, Maven resolves whatever is newest in Central at run time and how a release
   rewrites its version can change with no commit anywhere to explain it.
-- This repository's Actions **Access** set to *"Accessible from repositories in the
-  organization"*, or nothing can call it.
+- Nothing — this repository is **public**, so any repo can call it. (Were it private,
+  its Actions **Access** would have to be *"Accessible from repositories in the
+  organization"*, which limits callers to this org.)
 
 ## Versioning
 

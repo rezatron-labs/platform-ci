@@ -38,7 +38,7 @@ on:
         type: string
       gitops-repo:
         required: false
-        default: rezatron-labs/rezatron-gitops
+        default: rezatron-labs/platform-gitops
         type: string
       overlay-path:
         required: false
@@ -181,7 +181,7 @@ jobs:
 
   deploy-prod:
     needs: promote
-    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    uses: rezatron-labs/platform-ci/.github/workflows/spring-deploy.yml@v1
     with:
       service: ${{ inputs.service }}
       env: prod
@@ -250,7 +250,7 @@ jobs:
 
       - name: Resolve the pom version conflict
         if: env.BACKMERGE == 'pom-conflict'
-        uses: rezatron-labs/rezatron-ci/actions/resolve-pom-merge@v1
+        uses: rezatron-labs/platform-ci/actions/resolve-pom-merge@v1
         with:
           version: ${{ env.DEV_VERSION }}
 

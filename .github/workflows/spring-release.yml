@@ -46,7 +46,7 @@ on:
         type: string
       gitops-repo:
         required: false
-        default: rezatron-labs/rezatron-gitops
+        default: rezatron-labs/platform-gitops
         type: string
       overlay-path:
         required: false
@@ -214,7 +214,7 @@ jobs:
 
   deploy-stage:
     needs: candidate
-    uses: rezatron-labs/rezatron-ci/.github/workflows/spring-deploy.yml@v1
+    uses: rezatron-labs/platform-ci/.github/workflows/spring-deploy.yml@v1
     with:
       service: ${{ inputs.service }}
       env: stage
