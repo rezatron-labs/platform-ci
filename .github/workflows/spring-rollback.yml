@@ -61,16 +61,27 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
-          # A typo here would point an environment at a tag that does not exist, and the failure
-          # would surface as a stuck deploy rather than a failed workflow.
-          # --insecure fallback: the registry is plain HTTP on the LAN, which the daemon is
-          # configured for but `docker manifest` is not.
-          if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1 \
-            && ! docker manifest inspect --insecure "$IMAGE" >/dev/null 2>&1; then
-            echo "::error::no image $IMAGE in the registry — check the tag"
+          # A typo here would point an environment at a tag that does not exist, and the
+          # failure would surface as a stuck deploy rather than a failed workflow.
+          #
+          # Three attempts, because none is reliable alone. `docker manifest` talks to the
+          # registry directly, so the daemon's insecure-registries does not apply — hence
+          # --insecure. But it is also an EXPERIMENTAL CLI command: where experimental
+          # features are off it refuses outright, which previously looked identical to "tag
+          # not found" and blamed the operator. `docker pull` goes through the daemon and
+          # always works, so it is the arbiter; its stderr is kept and printed rather than
+          # discarded, so a real failure says what actually went wrong.
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1 \
+            || docker manifest inspect --insecure "$IMAGE" >/dev/null 2>&1; then
+            echo "$IMAGE exists (manifest)"
+          elif PULL_ERR=$(docker pull "$IMAGE" 2>&1); then
+            echo "$IMAGE exists (pulled)"
+          else
+            echo "::error::cannot resolve $IMAGE in the registry — check the tag"
+            echo "$PULL_ERR"
             exit 1
           fi
-          echo "$IMAGE exists; rolling ${{ inputs.env }} back to it"
+          echo "rolling ${{ inputs.env }} back to $IMAGE"
 
   deploy:
     needs: verify-image
