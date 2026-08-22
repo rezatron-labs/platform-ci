@@ -4,9 +4,9 @@ Shared GitHub Actions pipeline for every Spring Boot service on the Rezatron pla
 One implementation of the release lifecycle, called by each service repo, so a fix lands
 once instead of three times.
 
-Design rationale: [ADR 0002](https://github.com/rezatron-labs/rezatron-template) (runbook,
-local-only) — GitFlow, release candidates, build-once/promote-many, and why the version
-stays committed in the pom.
+Design rationale lives in the platform runbook, which is not published: ADR 0002 (GitFlow,
+release candidates, build-once/promote-many, and why the version stays committed in the
+pom) and ADR 0003 (why one shared pipeline, and what pinning `@v1` costs).
 
 ## What's here
 
