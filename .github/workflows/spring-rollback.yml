@@ -56,9 +56,11 @@ jobs:
         env:
           IMAGE: ${{ inputs.registry }}/${{ inputs.service }}:${{ inputs.image-tag }}
           REGISTRY: ${{ inputs.registry }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
           # A typo here would point an environment at a tag that does not exist, and the failure
           # would surface as a stuck deploy rather than a failed workflow.
           # --insecure fallback: the registry is plain HTTP on the LAN, which the daemon is

@@ -59,6 +59,13 @@ on:
 jobs:
   write-desired-state:
     runs-on: ${{ fromJSON(inputs.runner) }}
+    # Overlay writes for one service+env serialise HERE rather than at the caller's
+    # workflow-level group. publish sets cancel-in-progress on its group, and that flag
+    # belongs to the incoming run — so sharing a group with publish meant a merge to develop
+    # could cancel an in-flight rollback, potentially between the gitops commit and its push.
+    concurrency:
+      group: desired-state-${{ inputs.service }}-${{ inputs.env }}
+      cancel-in-progress: false
     steps:
       - name: Validate target environment
         shell: bash
@@ -95,8 +102,15 @@ jobs:
           # yq as a downloaded binary, not its container: this job's `docker` talks to the HOST
           # daemon over a mounted socket, so `docker run -v "$PWD:…"` would mount a host path
           # that does not hold the runner container's checkout. A binary sees the files directly.
+          # Verified and retried: this download sits in the critical path of every deploy on
+          # the platform, prod and rollbacks included. Unpinned, a replaced release asset
+          # would silently gain write access to desired state.
           YQ=/tmp/yq
-          curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
+          YQ_SHA256=a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7
+          curl -fsSL --retry 3 --retry-delay 2 \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
+          echo "$YQ_SHA256  $YQ" | sha256sum -c - >/dev/null \
+            || { echo "::error::yq checksum mismatch — refusing to write desired state"; exit 1; }
           chmod +x "$YQ"
 
           OVERLAY="${OVERLAY_DIR:-$SERVICE}/${TARGET_ENV}/override.yaml"

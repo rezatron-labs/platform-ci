@@ -77,9 +77,12 @@ jobs:
         # image build is the single source of truth for what ships.
         env:
           IMAGE: ${{ inputs.registry }}/${{ inputs.service }}:${{ steps.tag.outputs.tag }}
+          REGISTRY: ${{ inputs.registry }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.NEXUS_PASS }}" | docker login "${{ inputs.registry }}" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
 

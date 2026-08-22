@@ -115,6 +115,14 @@ jobs:
             # main's pom is what prod is running, so a hotfix is by definition its next patch.
             # Anything larger is a release and belongs in spring-release, cut from develop.
             MAIN_POM=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+            # Validate before the arithmetic: a -SNAPSHOT or four-segment version makes
+            # $(( PATCH + 1 )) fail with an unbound-variable error that says nothing useful,
+            # in the one path that runs during an incident.
+            echo "$MAIN_POM" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+              echo "::error::main's pom is '$MAIN_POM', not a released MAJOR.MINOR.PATCH version."
+              echo "::error::A hotfix branches from what prod is running; this service has not shipped through this pipeline yet."
+              exit 1
+            }
             MAJOR=${MAIN_POM%%.*}; TAIL=${MAIN_POM#*.}; MINOR=${TAIL%%.*}; PATCH=${TAIL#*.}
             EXPECTED="$MAJOR.$MINOR.$(( PATCH + 1 ))"
             if [ "$V" != "$EXPECTED" ]; then
@@ -182,14 +190,19 @@ jobs:
 
       - name: Build and push the candidate image
         if: env.MODE == 'candidate'
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
           docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
           docker push "$REGISTRY/$SERVICE:$RC_TAG"
 
       - name: Create GitHub pre-release
+        # Cosmetic, and runs after the tag and image are published — see spring-release.
         if: env.MODE == 'candidate'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

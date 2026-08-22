@@ -106,8 +106,14 @@ jobs:
             # Default to exactly what stage is running. Promoting "the newest candidate" would
             # let a build nobody soaked reach prod; promoting what the stage overlay points at
             # means prod gets the bytes that were actually validated.
+            # Verified and retried: an unpinned asset here chooses which candidate gets
+            # promoted to prod.
             YQ=/tmp/yq
-            curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
+            YQ_SHA256=a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7
+            curl -fsSL --retry 3 --retry-delay 2 \
+              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$YQ"
+            echo "$YQ_SHA256  $YQ" | sha256sum -c - >/dev/null \
+              || { echo "::error::yq checksum mismatch"; exit 1; }
             chmod +x "$YQ"
             OVERLAY="gitops/${OVERLAY_DIR:-$SERVICE}/stage/override.yaml"
             test -f "$OVERLAY" || { echo "::error::no stage overlay at $OVERLAY"; exit 1; }
@@ -142,20 +148,57 @@ jobs:
           echo "final_tag=v$V" >> "$GITHUB_OUTPUT"
           echo "promoting $RC_TAG from $SRC_BRANCH to prod as v$V"
 
-      - name: Merge into main and tag the release
+      - name: Start the merge into main
         run: |
           set -euo pipefail
           git config user.name ci-bot
           git config user.email ci@rezatron
           git switch -C main origin/main
 
-          # Both guards make a re-run after a partial failure a no-op rather than an error.
+          # Idempotency guard: a re-run after a partial failure is a no-op, not an error.
           if git merge-base --is-ancestor "refs/tags/$RC_TAG" HEAD; then
             echo "main already contains $RC_TAG; skipping merge"
-          else
-            git merge --no-ff "origin/$SRC_BRANCH" -m "release: promote v$V to prod"
+            echo "FORWARD_MERGE=skip" >> "$GITHUB_ENV"
+            exit 0
           fi
 
+          # This conflicts on pom.xml whenever main carries a commit develop has not
+          # absorbed - which is true after every hotfix, and true of any service whose
+          # first release predates this pipeline. main says the previous release, the
+          # release branch says $V, and the merge base says neither. Exactly the shape the
+          # back-merge already handles, so it gets the same treatment rather than a bare
+          # merge that fails the promotion outright.
+          if git merge --no-ff --no-commit "origin/$SRC_BRANCH"; then
+            echo "FORWARD_MERGE=clean" >> "$GITHUB_ENV"
+          else
+            UNMERGED=$(git diff --name-only --diff-filter=U)
+            if [ "$UNMERGED" != "pom.xml" ]; then
+              echo "::error::promotion merge conflicts outside pom.xml, resolve by hand:"
+              echo "$UNMERGED"
+              git merge --abort
+              exit 1
+            fi
+            echo "FORWARD_MERGE=pom-conflict" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve the pom version conflict
+        if: env.FORWARD_MERGE == 'pom-conflict'
+        # main must end up carrying the released version, so this resolves to $V - the
+        # mirror of the back-merge, which resolves to develop's -SNAPSHOT.
+        uses: rezatron-labs/platform-ci/actions/resolve-pom-merge@v1
+        with:
+          version: ${{ inputs.version }}
+
+      - name: Commit the merge, tag, and push
+        if: env.FORWARD_MERGE != 'skip'
+        run: |
+          set -euo pipefail
+          git add pom.xml
+          git commit -m "release: promote v$V to prod"
+
+      - name: Tag the release and push main
+        run: |
+          set -euo pipefail
           # The final tag lands on main, where GitFlow says a release is born. The rc tags
           # record what was BUILT; this one records what SHIPPED.
           if git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
@@ -167,22 +210,56 @@ jobs:
           git push origin main
           git push origin "refs/tags/v$V"
 
+      - name: Create the GitHub release
+        # The candidates are published as prereleases so they never displace a real release.
+        # This is the one that ships, so it is the one "latest release" should point at —
+        # without this, every release on the platform is a prerelease and "latest" is empty.
+        # Cosmetic, and it runs after main and the tag are pushed, so it must not fail the job.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"v$V\",\"name\":\"v$V\",\"prerelease\":false,\"generate_release_notes\":true}"
+
       - name: Re-tag the validated candidate as the final version
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
           SRC="$REGISTRY/$SERVICE:$RC_TAG"
           DST="$REGISTRY/$SERVICE:v$V"
 
+          # Each digest is extracted in two stages, deliberately. A `grep` inside a pipeline
+          # under `set -o pipefail` exits non-zero when it matches nothing, which killed the
+          # step before the explicit emptiness check below could ever report why; and
+          # `grep | head` can take a SIGPIPE and fail an otherwise-good promotion.
           docker pull "$SRC"
-          SRC_DIGEST=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$SRC" \
-            | grep "^$REGISTRY/$SERVICE@" | head -n1 | cut -d@ -f2)
-          docker tag "$SRC" "$DST"
-          DST_DIGEST=$(docker push "$DST" | grep -oE 'sha256:[0-9a-f]{64}' | tail -n1)
+          INSPECT=$(docker inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "$SRC")
+          SRC_DIGEST=$(printf '%s\n' "$INSPECT" | { grep -m1 "^$REGISTRY/$SERVICE@" || true; } | cut -d@ -f2)
+          if [ -z "$SRC_DIGEST" ]; then
+            echo "::error::could not read a registry digest for $SRC — cannot prove the promotion re-tags rather than rebuilds"
+            echo "$INSPECT"
+            exit 1
+          fi
 
-          # If these ever differ, something rebuilt instead of re-tagging and prod would be
-          # running code stage never saw. That is the one thing this pipeline must not do.
-          if [ -z "$SRC_DIGEST" ] || [ "$SRC_DIGEST" != "$DST_DIGEST" ]; then
+          docker tag "$SRC" "$DST"
+          PUSH_OUT=$(docker push "$DST")
+          DST_DIGEST=$(printf '%s\n' "$PUSH_OUT" | { grep -oE 'sha256:[0-9a-f]{64}' || true; } | tail -n1)
+          if [ -z "$DST_DIGEST" ]; then
+            echo "::error::could not read a digest from the push output — cannot verify the promotion"
+            echo "$PUSH_OUT"
+            exit 1
+          fi
+
+          # If these differ, something rebuilt instead of re-tagging and prod would be running
+          # code stage never saw. That is the one thing this pipeline must not do.
+          if [ "$SRC_DIGEST" != "$DST_DIGEST" ]; then
             echo "::error::promoted digest ($DST_DIGEST) does not match the validated candidate ($SRC_DIGEST)"
             exit 1
           fi

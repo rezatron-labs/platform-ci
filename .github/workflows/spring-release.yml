@@ -186,32 +186,66 @@ jobs:
           git push origin "refs/tags/$RC_TAG"
 
       - name: Move develop to the next -SNAPSHOT
-        if: env.MODE == 'cut'
         # GitFlow bumps develop when the release is CUT, not when it reaches prod. Deferring it
         # leaves develop — and so every int build's /actuator/info — claiming the version that
         # just branched away, for the entire length of the stage soak.
         #
-        # This push wakes the service's publish workflow, which is intended: int should track
+        # Deliberately NOT gated on MODE: it re-derives whether develop still needs the bump
+        # from develop's own pom. The branch and tag are already pushed by this point, so a
+        # failure here used to be unrecoverable — a re-dispatch saw release/$V and switched to
+        # candidate mode, skipping the bump forever and blocking every future release.
+        #
+        # The push wakes the service's publish workflow, which is intended: int should track
         # develop, and that build is what makes int start reporting the new -SNAPSHOT.
         run: |
           set -euo pipefail
+          git fetch --prune origin develop
           git switch -C develop origin/develop
+
+          DEV_POM=$(./mvnw -B -q -DforceStdout help:evaluate -Dexpression=project.version | tail -n1 | tr -d '[:space:]')
+          if [ "$DEV_POM" != "$V-SNAPSHOT" ]; then
+            echo "develop is at $DEV_POM, not $V-SNAPSHOT; nothing to bump"
+            git switch "release/$V"
+            exit 0
+          fi
+
           ./mvnw -B -q versions:set -DnewVersion="$NEXT-SNAPSHOT" -DgenerateBackupPoms=false
           git add pom.xml
           git commit -m "chore(release): begin $NEXT-SNAPSHOT"
-          git push origin develop
+
+          # Anything merged to develop while this release was building makes a plain push a
+          # non-fast-forward. Rebase and retry rather than leave develop claiming a branched
+          # version.
+          pushed=0
+          for _ in 1 2 3 4 5; do
+            if git pull --rebase origin develop && git push origin develop; then pushed=1; break; fi
+            git rebase --abort 2>/dev/null || true
+            sleep 3
+          done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::error::could not push the develop bump after 5 attempts — land 'chore: bump develop to $NEXT-SNAPSHOT' by hand"
+            exit 1
+          fi
           git switch "release/$V"
 
       - name: Build and push the candidate image
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.NEXUS_PASS }}" | docker login "$REGISTRY" -u "${{ secrets.NEXUS_USER }}" --password-stdin
+          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
           docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
           docker push "$REGISTRY/$SERVICE:$RC_TAG"
 
       - name: Create GitHub pre-release
         # curl rather than `gh`: never assume tooling on a self-hosted runner. Marked
-        # prerelease so "latest release" keeps pointing at the last thing that reached prod.
+        # prerelease so a candidate never displaces a real release in the GitHub UI.
+        #
+        # continue-on-error because this runs AFTER the branch, tag and image are published:
+        # a 422 or a network blip must not fail the job and skip the stage deploy when every
+        # load-bearing step already succeeded. Release notes are cosmetic.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

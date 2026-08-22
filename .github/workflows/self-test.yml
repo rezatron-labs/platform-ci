@@ -45,9 +45,16 @@ jobs:
         # and this check is what keeps them honest when a new major is cut.
         run: |
           set -euo pipefail
-          if grep -rn 'rezatron-labs/platform-ci/.*@\(main\|master\)' .github/workflows/ actions/; then
-            echo "::error::internal references must pin a release tag, not a branch"
+          # Allow-list rather than deny-list: the previous check only rejected @main and
+          # @master, so @develop or a feature branch passed, and it was hardcoded to this
+          # repo's name so it went blind the moment the repo was renamed.
+          REFS=$(grep -rhoE '\buses: [A-Za-z0-9._-]+/[A-Za-z0-9._-]+[^ ]*@[^ ]+' .github/workflows/ actions/ \
+                 | sed 's/^uses: //' | sort -u)
+          echo "external references:"
+          echo "$REFS" | sed 's/^/  /'
+          BAD=$(echo "$REFS" | grep -v '@v[0-9]' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::every reference must pin a release tag (@vN...), not a branch or SHA-less ref:"
+            echo "$BAD"
             exit 1
           fi
-          echo "internal refs:"
-          grep -rho 'rezatron-labs/platform-ci/[^ ]*@[^ ]*' .github/workflows/ actions/ | sort -u
