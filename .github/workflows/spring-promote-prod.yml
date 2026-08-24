@@ -344,16 +344,88 @@ jobs:
         if: env.BACKMERGE == 'clean'
         run: ./mvnw -B -q versions:set -DnewVersion="$DEV_VERSION" -DgenerateBackupPoms=false
 
-      - name: Verify and push the back-merge
+      - name: Verify the back-merge and file it as a pull request
         if: env.BACKMERGE != 'skip'
+        # develop cannot be pushed to directly: its required status checks run on
+        # pull_request only, so a commit pushed straight there can never have them report and
+        # the push is refused whoever makes it. The back-merge therefore arrives as a PR.
+        #
+        # Auto-merge uses MERGE, never SQUASH. The whole point of this commit is the merge
+        # relationship it carries: squashing flattens it, main stops being an ancestor of
+        # develop, and the NEXT promotion re-runs this same merge and hits the same pom
+        # conflict again, forever.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          command -v python3 >/dev/null \
+            || { echo "::error::python3 is not on this runner — cannot file the back-merge PR"; exit 1; }
+
           git add pom.xml
-          # Gate the resolution: whatever the merge produced has to compile and pass tests
-          # before it is allowed onto develop.
+          # Gate the resolution before filing anything. The PR's own required checks are what
+          # ultimately blocks the merge, so this run is duplicated work — and it is kept
+          # anyway, because prod is already deployed by this point. A bad resolution has to
+          # fail this run loudly and immediately; leaving it to the PR checks would report the
+          # promotion as a success while develop silently never receives the back-merge.
           ./mvnw -B verify ${{ inputs.verify-args }}
           git commit -m "chore(release): back-merge v$V into develop (keep $DEV_VERSION)"
-          git push origin develop
+
+          BRANCH="chore/back-merge-v$V"
+          git branch -f "$BRANCH" HEAD
+          git push -f origin "$BRANCH"
+
+          python3 - "$BRANCH" "$V" "$DEV_VERSION" <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          branch, version, dev_version = sys.argv[1], sys.argv[2], sys.argv[3]
+          repo, token = os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"]
+
+          def call(url, payload):
+              req = urllib.request.Request(
+                  url, data=json.dumps(payload).encode(),
+                  headers={"Authorization": "Bearer " + token,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json"})
+              return json.load(urllib.request.urlopen(req, timeout=30))
+
+          try:
+              pr = call("https://api.github.com/repos/%s/pulls" % repo, {
+                  "title": "chore(release): back-merge v%s into develop" % version,
+                  "head": branch, "base": "develop",
+                  "body": ("Closes GitFlow's loop: develop picks up whatever was stabilised on "
+                           "the release branch, keeping its own version `%s`.\n\nFiled as a "
+                           "pull request because develop's required checks only run on "
+                           "`pull_request`, so a direct push can never satisfy them.\n\n"
+                           "**Merge with a merge commit, not a squash.** The value of this "
+                           "commit is the merge relationship it carries; squashing it makes "
+                           "main stop being an ancestor of develop, and the next promotion "
+                           "re-runs this merge and hits the same pom conflict again."
+                           % dev_version)})
+          except urllib.error.HTTPError as e:
+              body = e.read().decode(errors="replace")
+              if e.code == 403 and "not permitted to create" in body:
+                  print("::error::Actions is forbidden from creating pull requests. The "
+                        "setting exists at BOTH org and repository level and the org one "
+                        "does not override the repo one, so check the repository's own "
+                        "'Allow GitHub Actions to create and approve pull requests'")
+              sys.exit("::error::could not open the back-merge PR: %s %s" % (e.code, body[:300]))
+
+          print("opened #%s" % pr["number"])
+
+          try:
+              r = call("https://api.github.com/graphql", {
+                  "query": "mutation($id:ID!){enablePullRequestAutoMerge("
+                           "input:{pullRequestId:$id,mergeMethod:MERGE}){clientMutationId}}",
+                  "variables": {"id": pr["node_id"]}})
+              if r.get("errors"):
+                  sys.exit("::error::auto-merge refused, PR #%s left open: %s"
+                           % (pr["number"], r["errors"]))
+          except urllib.error.HTTPError as e:
+              sys.exit("::error::auto-merge call failed, PR #%s left open: %s"
+                       % (pr["number"], e.code))
+
+          print("auto-merge armed on #%s" % pr["number"])
+          PY
 
       - name: Retire the stabilisation branch
         run: |
