@@ -64,6 +64,17 @@ on:
         required: true
       GITOPS_DEPLOY_KEY:
         required: true
+      RELEASE_APP_ID:
+        description: >
+          App id of the GitHub App that opens this workflow's pull requests. Not required, so
+          a caller without it still validates -- the step that needs it fails with an
+          actionable message instead. It cannot be GITHUB_TOKEN: GitHub does not trigger
+          workflows from events that token causes, so a PR opened with it never receives the
+          checks develop requires and could never be merged.
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: "Private key for RELEASE_APP_ID, in PEM form."
+        required: false
 
 jobs:
   promote:
@@ -344,6 +355,17 @@ jobs:
         if: env.BACKMERGE == 'clean'
         run: ./mvnw -B -q versions:set -DnewVersion="$DEV_VERSION" -DgenerateBackupPoms=false
 
+      - name: Mint a token for the back-merge pull request
+        id: app-token
+        # continue-on-error so a missing or misconfigured App degrades to a clear message in
+        # the step below rather than a failed release. The App exists only to open this PR;
+        # everything load-bearing has already happened by here.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Verify the back-merge and file it as a pull request
         if: env.BACKMERGE != 'skip'
         # develop cannot be pushed to directly: its required status checks run on
@@ -355,11 +377,22 @@ jobs:
         # develop, and the NEXT promotion re-runs this same merge and hits the same pom
         # conflict again, forever.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           command -v python3 >/dev/null \
             || { echo "::error::python3 is not on this runner — cannot file the back-merge PR"; exit 1; }
+
+          # The App token is what makes this work at all. GitHub does not trigger workflows
+          # from events caused by GITHUB_TOKEN, so a PR opened with it gets NO checks -- and
+          # develop requires checks, so that PR could never merge, by anyone, ever. An App
+          # installation token is a different identity and its events trigger normally.
+          #
+          # The branch push above deliberately still uses GITHUB_TOKEN: nothing needs to
+          # observe it, and the PR is opened once and never updated, so no later push event
+          # has to fire either.
+          [ -n "${GH_TOKEN:-}" ] \
+            || { echo "::error::no App token — set the RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY org secrets and install the App on this repo. Opening the PR with GITHUB_TOKEN would produce one that can never be merged, so it is not attempted."; exit 1; }
 
           git add pom.xml
           # Gate the resolution before filing anything. The PR's own required checks are what
