@@ -185,20 +185,51 @@ jobs:
           git push origin "release/$V"
           git push origin "refs/tags/$RC_TAG"
 
-      - name: Move develop to the next -SNAPSHOT
+      - name: Build and push the candidate image
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
+          docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
+          docker push "$REGISTRY/$SERVICE:$RC_TAG"
+
+      - name: Open the develop bump as a pull request
         # GitFlow bumps develop when the release is CUT, not when it reaches prod. Deferring it
         # leaves develop — and so every int build's /actuator/info — claiming the version that
         # just branched away, for the entire length of the stage soak.
         #
-        # Deliberately NOT gated on MODE: it re-derives whether develop still needs the bump
-        # from develop's own pom. The branch and tag are already pushed by this point, so a
-        # failure here used to be unrecoverable — a re-dispatch saw release/$V and switched to
-        # candidate mode, skipping the bump forever and blocking every future release.
+        # It goes through a PULL REQUEST rather than a direct push, because develop's required
+        # status checks only ever run on pull_request. A commit pushed straight to develop can
+        # therefore never have them report, and the push is refused no matter who makes it —
+        # including a repository admin. The PR is the only thing that makes those checks
+        # runnable on this commit, and auto-merge lands it with no human in the loop.
         #
-        # The push wakes the service's publish workflow, which is intended: int should track
-        # develop, and that build is what makes int start reporting the new -SNAPSHOT.
+        # Deliberately NOT gated on MODE: it re-derives whether develop still needs the bump
+        # from develop's own pom, so a re-dispatch that switched to candidate mode still files
+        # it rather than skipping it forever.
+        #
+        # Merging the PR wakes the service's publish workflow, which is intended: int should
+        # track develop, and that build is what makes int start reporting the new -SNAPSHOT.
+        #
+        # continue-on-error, and placed AFTER the image is pushed, because this is housekeeping.
+        # A release whose branch, tag and image all published correctly must not be reported as
+        # failed — and must not skip the stage deploy — because a version bump could not be
+        # filed. When it does fail, the next release refuses to cut with an error naming exactly
+        # what to land, so it surfaces loudly rather than silently.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # Checked rather than assumed: this is a self-hosted pool whose image can change
+          # under us, and a JSON parser improvised out of grep would fail by filing the wrong
+          # thing rather than by failing.
+          command -v python3 >/dev/null \
+            || { echo "::error::python3 is not on this runner — cannot file the bump PR"; exit 1; }
+
           git fetch --prune origin develop
           git switch -C develop origin/develop
 
@@ -209,34 +240,69 @@ jobs:
             exit 0
           fi
 
+          BRANCH="chore/begin-$NEXT-SNAPSHOT"
+          git switch -c "$BRANCH"
           ./mvnw -B -q versions:set -DnewVersion="$NEXT-SNAPSHOT" -DgenerateBackupPoms=false
           git add pom.xml
           git commit -m "chore(release): begin $NEXT-SNAPSHOT"
+          # Force, so re-dispatching after a failed run reuses the branch instead of colliding
+          # with the one the failed run left behind.
+          git push -f origin "$BRANCH"
 
-          # Anything merged to develop while this release was building makes a plain push a
-          # non-fast-forward. Rebase and retry rather than leave develop claiming a branched
-          # version.
-          pushed=0
-          for _ in 1 2 3 4 5; do
-            if git pull --rebase origin develop && git push origin develop; then pushed=1; break; fi
-            git rebase --abort 2>/dev/null || true
-            sleep 3
-          done
-          if [ "$pushed" -ne 1 ]; then
-            echo "::error::could not push the develop bump after 5 attempts — land 'chore: bump develop to $NEXT-SNAPSHOT' by hand"
-            exit 1
-          fi
+          # curl and python3 rather than `gh`: never assume tooling on a self-hosted runner.
+          # Auto-merge has no REST endpoint, so the PR is created over REST and then armed over
+          # GraphQL, which needs the node id the create call already returned.
+          python3 - "$BRANCH" "$NEXT" <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          branch, nxt = sys.argv[1], sys.argv[2]
+          repo, token = os.environ["GITHUB_REPOSITORY"], os.environ["GH_TOKEN"]
+
+          def call(url, payload):
+              req = urllib.request.Request(
+                  url, data=json.dumps(payload).encode(),
+                  headers={"Authorization": "Bearer " + token,
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json"})
+              return json.load(urllib.request.urlopen(req, timeout=30))
+
+          try:
+              pr = call("https://api.github.com/repos/%s/pulls" % repo, {
+                  "title": "chore(release): begin %s-SNAPSHOT" % nxt,
+                  "head": branch, "base": "develop",
+                  "body": ("Automated GitFlow bump: develop stops claiming the version that "
+                           "just branched away.\n\nFiled as a pull request because develop's "
+                           "required checks only run on `pull_request`, so a direct push can "
+                           "never satisfy them. Auto-merge is armed; this lands itself once "
+                           "the checks pass.")})
+          except urllib.error.HTTPError as e:
+              body = e.read().decode(errors="replace")
+              if e.code == 403 and "not allowed to create" in body:
+                  print("::error::the org forbids Actions from creating pull requests — "
+                        "enable 'Allow GitHub Actions to create and approve pull requests'")
+              sys.exit("::error::could not open the bump PR: %s %s" % (e.code, body[:300]))
+
+          print("opened #%s" % pr["number"])
+
+          try:
+              r = call("https://api.github.com/graphql", {
+                  "query": "mutation($id:ID!){enablePullRequestAutoMerge("
+                           "input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}",
+                  "variables": {"id": pr["node_id"]}})
+              if r.get("errors"):
+                  # Left open on purpose rather than merged directly: merging here would need
+                  # the checks to have already finished, and waiting on them would hold a
+                  # runner for the length of the test suite.
+                  sys.exit("::error::auto-merge refused, PR #%s left open: %s"
+                           % (pr["number"], r["errors"]))
+          except urllib.error.HTTPError as e:
+              sys.exit("::error::auto-merge call failed, PR #%s left open: %s"
+                       % (pr["number"], e.code))
+
+          print("auto-merge armed on #%s" % pr["number"])
+          PY
+
           git switch "release/$V"
-
-      - name: Build and push the candidate image
-        env:
-          NEXUS_USER: ${{ secrets.NEXUS_USER }}
-          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
-          docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
-          docker push "$REGISTRY/$SERVICE:$RC_TAG"
 
       - name: Create GitHub pre-release
         # curl rather than `gh`: never assume tooling on a self-hosted runner. Marked
