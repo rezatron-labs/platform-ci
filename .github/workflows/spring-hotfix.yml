@@ -196,7 +196,15 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$NEXUS_PASS" | docker login "$REGISTRY" -u "$NEXUS_USER" --password-stdin
-          docker build -t "$REGISTRY/$SERVICE:$RC_TAG" .
+          # GIT_COMMIT lets the running application report which commit it was built from --
+          # rto-tracker surfaces it at /api/v1/version and links it from its UI footer. Read
+          # from the checked-out tree rather than from github.sha on purpose: release and
+          # hotfix COMMIT a version bump before this step, so github.sha is the dispatch ref,
+          # not the commit actually being built. HEAD is right in all three workflows.
+          #
+          # Safe for every service: Docker only WARNS about a build-arg the Dockerfile does not
+          # declare, so a service without `ARG GIT_COMMIT` is unaffected.
+          docker build --build-arg GIT_COMMIT="$(git rev-parse HEAD)" -t "$REGISTRY/$SERVICE:$RC_TAG" .
           docker push "$REGISTRY/$SERVICE:$RC_TAG"
 
       - name: Create GitHub pre-release
