@@ -238,7 +238,15 @@ jobs:
           # actual invariant, now enforced rather than assumed.
           [ -n "${MAIN_PUSH_TOKEN:-}" ] \
             || { echo "::error::no App token — main only accepts pushes from the rezatron-release App (main-pipeline-only ruleset). Set the RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY org secrets and install the App on this repo."; exit 1; }
-          git push "https://x-access-token:${MAIN_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          #
+          # The extraheader override is not optional: actions/checkout persists GITHUB_TOKEN
+          # as an http.extraheader Authorization in .git/config, and that header silently WINS
+          # over the token in the push URL — the push authenticates as github-actions[bot] and
+          # the ruleset rejects it. Blanking the header for this one command is what makes the
+          # App token actually reach GitHub (verified via the ruleset's rule-suites audit log,
+          # which recorded the rejected pusher as github-actions[bot], not the App).
+          git -c "http.https://github.com/.extraheader=" \
+            push "https://x-access-token:${MAIN_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
 
           # The tag still goes with GITHUB_TOKEN: the immutable-release-tags ruleset blocks
           # update and deletion of shipped v* tags, but creation is open to the workflow.
