@@ -207,7 +207,20 @@ jobs:
           git add pom.xml
           git commit -m "release: promote v$V to prod"
 
+      - name: Mint a token to push main
+        id: main-push-token
+        # continue-on-error so a missing or misconfigured App fails in the push step below
+        # with an actionable message instead of this action's generic one. Nothing has been
+        # pushed or deployed yet at this point, so failing there aborts the promotion cleanly.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Tag the release and push main
+        env:
+          MAIN_PUSH_TOKEN: ${{ steps.main-push-token.outputs.token }}
         run: |
           set -euo pipefail
           # The final tag lands on main, where GitFlow says a release is born. The rc tags
@@ -218,7 +231,17 @@ jobs:
             git tag -a "v$V" -m "$SERVICE v$V"
           fi
 
-          git push origin main
+          # main is pushed as the rezatron-release App, not GITHUB_TOKEN: every service repo
+          # carries a "main-pipeline-only" ruleset that blocks main updates from everyone —
+          # humans and stray automation alike — with the App as the sole bypass actor. The
+          # promotion is therefore the only path that can write main, which is the platform's
+          # actual invariant, now enforced rather than assumed.
+          [ -n "${MAIN_PUSH_TOKEN:-}" ] \
+            || { echo "::error::no App token — main only accepts pushes from the rezatron-release App (main-pipeline-only ruleset). Set the RELEASE_APP_ID and RELEASE_APP_PRIVATE_KEY org secrets and install the App on this repo."; exit 1; }
+          git push "https://x-access-token:${MAIN_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+
+          # The tag still goes with GITHUB_TOKEN: the immutable-release-tags ruleset blocks
+          # update and deletion of shipped v* tags, but creation is open to the workflow.
           git push origin "refs/tags/v$V"
 
       - name: Create the GitHub release
