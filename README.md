@@ -88,6 +88,14 @@ jobs:
   separately, on the same commit, before any image is built.
 - `main` and `develop` branches, and a single-module `pom.xml` whose project `<version>`
   follows `</parent>`.
+- The service repo's protections match the platform standard (platform-runbook ADR 0009):
+  `develop` requires a pull request (0 approvals) with the quality checks and **no** linear
+  history — the back-merge lands as a merge commit; `main` has **no** required checks, PR
+  requirement, or linear history — the promotion pushes a merge commit directly — plus a
+  `main-pipeline-only` ruleset whose sole bypass actor is the `rezatron-release` App (which
+  is what pushes main), and an `immutable-release-tags` ruleset protecting shipped `v*` tags
+  while leaving `v*-rc.*` deletable for the re-dispatch recovery. Auto-merge on, merge
+  commits allowed. Any deviation fails late and misleadingly, so fix settings first.
 - `versions-maven-plugin` and `maven-help-plugin` pinned in the service's own
   `<pluginManagement>`. These workflows drive both by short prefix against the service's
   pom; unpinned, Maven resolves whatever is newest in Central at run time and how a release
